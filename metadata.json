@@ -1,0 +1,10 @@
+{
+  "name": "Remix: DeepSeek Workspace",
+  "description": "привет, ничего пока не меняй в этом проекте ",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
