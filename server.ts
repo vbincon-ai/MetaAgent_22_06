@@ -1910,12 +1910,19 @@ app.post("/api/chat", async (req, res): Promise<any> => {
           
           if (msg.tool_calls) {
             for (const tc of msg.tool_calls) {
+              let parsedArgs = tc.function.arguments;
+              if (typeof parsedArgs === "string") {
+                try {
+                  parsedArgs = JSON.parse(parsedArgs);
+                } catch (e) {
+                  console.warn(`[Gemini Request Formatter] Failed to parse tool arguments for tool '${tc.function.name}':`, tc.function.arguments);
+                  parsedArgs = {};
+                }
+              }
               parts.push({
                 functionCall: {
                   name: tc.function.name,
-                  args: typeof tc.function.arguments === "string" 
-                    ? JSON.parse(tc.function.arguments) 
-                    : tc.function.arguments
+                  args: parsedArgs
                 }
               });
             }
