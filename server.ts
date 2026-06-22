@@ -7,6 +7,12 @@ import { promisify } from "util";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+// @ts-ignore
+import pdf from "pdf-parse";
+// @ts-ignore
+import mammoth from "mammoth";
+// @ts-ignore
+import * as XLSX from "xlsx";
 
 const execAsync = promisify(exec);
 
@@ -1007,6 +1013,104 @@ async function scrape_url_tool(targetUrl: string): Promise<string> {
   }
 }
 
+function isBufferPlainText(buf: Buffer): boolean {
+  if (buf.length === 0) return true;
+  const checkLimit = Math.min(buf.length, 1024);
+  let binaryChars = 0;
+  for (let i = 0; i < checkLimit; i++) {
+    const byte = buf[i];
+    if (byte === 0) return false; // Null byte indicates binary
+    if (byte < 7 || (byte > 14 && byte < 32)) {
+      binaryChars++;
+    }
+  }
+  return (binaryChars / checkLimit) < 0.1;
+}
+
+async function parseFileToText(name: string, mimeType: string, base64Data: string): Promise<string> {
+  const buf = Buffer.from(base64Data, "base64");
+  const ext = name.split(".").pop()?.toLowerCase() || "";
+
+  // 1. PDF files
+  if (mimeType === "application/pdf" || ext === "pdf") {
+    try {
+      const data = await pdf(buf);
+      return `[Содержимое файла PDF "${name}"]: \n${data.text || ""}`;
+    } catch (e: any) {
+      console.warn(`[PDF Parse Error] Failed to parse PDF: ${e.message}`);
+      return `[Ошибка при извлечении текста из PDF "${name}"]: ${e.message}`;
+    }
+  }
+
+  // 2. Word documents (.docx)
+  if (mimeType.includes("word") || ext === "docx") {
+    try {
+      const result = await mammoth.extractRawText({ buffer: buf });
+      return `[Содержимое файла Word "${name}"]: \n${result.value || ""}`;
+    } catch (e: any) {
+      console.warn(`[Word Parse Error] Failed to parse DOCX: ${e.message}`);
+      return `[Ошибка при извлечении текста из документа Word "${name}"]: ${e.message}`;
+    }
+  }
+
+  // 3. Excel sheets & CSV (.xlsx, .xls, .csv, .tsv)
+  if (
+    mimeType.includes("sheet") || 
+    mimeType.includes("ms-excel") || 
+    mimeType.includes("csv") || 
+    ["xlsx", "xls", "csv", "tsv"].includes(ext)
+  ) {
+    try {
+      const workbook = XLSX.read(buf, { type: "buffer" });
+      let sheetTexts: string[] = [];
+      for (const sheetName of workbook.SheetNames) {
+        const worksheet = workbook.Sheets[sheetName];
+        const csvContent = XLSX.utils.sheet_to_csv(worksheet);
+        sheetTexts.push(`--- Лист "${sheetName}" ---\n${csvContent}`);
+      }
+      return `[Содержимое таблицы "${name}"]: \n${sheetTexts.join("\n\n")}`;
+    } catch (e: any) {
+      console.warn(`[Excel Parse Error] Failed to parse workbook: ${e.message}`);
+      return `[Ошибка при извлечении данных из таблицы "${name}"]: ${e.message}`;
+    }
+  }
+
+  // 4. Standard text or source code files
+  const isTextLike = mimeType.startsWith("text/") || 
+                     mimeType.includes("json") || 
+                     mimeType.includes("xml") || 
+                     mimeType.includes("javascript") || 
+                     mimeType.includes("typescript") ||
+                     mimeType.includes("yaml") ||
+                     mimeType.includes("markdown") ||
+                     [
+                       "py", "js", "ts", "tsx", "jsx", "json", "yml", "yaml", "html", "css", 
+                       "sh", "bash", "conf", "ini", "md", "txt", "log", "sql", "env", "cfg",
+                       "properties", "java", "c", "cpp", "h", "hpp", "cs", "go", "rs", "swift",
+                       "kt", "php", "rb", "pl", "pm", "r", "m", "dockerfile", "makefile", "gitignore"
+                     ].includes(ext);
+
+  if (isTextLike) {
+    try {
+      return `[Содержимое текстового файла "${name}"]: \n${buf.toString("utf-8")}`;
+    } catch (e: any) {
+      console.warn(`[Text Match parse error] failed: ${e.message}`);
+    }
+  }
+
+  // Smart plain-text fallback content check
+  try {
+    const isTxt = isBufferPlainText(buf);
+    if (isTxt) {
+      return `[Содержимое текстового файла "${name}" (определен как текст)]: \n${buf.toString("utf-8")}`;
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  return `[Вложенный файл: ${name} (тип: ${mimeType || "unknown"}) - двоичный формат, прямое распознавание текста не поддерживается]`;
+}
+
 /**
  * Helper function to format chat history for OpenAI-compatibility with vision capabilities
  */
@@ -1046,11 +1150,17 @@ function formatOpenAIMessages(loopMessages: any[], activeModel: string): any[] {
     const imageFiles = files.filter((f: any) => f.type && f.type.startsWith("image/"));
     const nonImageFiles = files.filter((f: any) => !f.type || !f.type.startsWith("image/"));
 
-    // Compile text prefix with non-image files listed as info
+    // Compile text prefix with non-image files listed as info and decrypted contents
     let customText = textContent;
     if (nonImageFiles.length > 0) {
-      const fileNames = nonImageFiles.map((f: any) => `[Вложенный файл: ${f.name} (тип: ${f.type || "unknown"})]`).join("\n");
-      customText = customText ? `${customText}\n\n${fileNames}` : fileNames;
+      const fileExcerpts = nonImageFiles.map((f: any) => {
+        if (f.parsedText) {
+          return f.parsedText;
+        }
+        return `[Вложенный файл: ${f.name} (тип: ${f.type || "unknown"}) - двоичный формат, содержимое скрыто]`;
+      }).join("\n\n");
+      
+      customText = customText ? `${customText}\n\n${fileExcerpts}` : fileExcerpts;
     }
 
     // Format with image_url blocks if vision is supported and there are image attachments
@@ -1160,6 +1270,27 @@ app.post("/api/chat", async (req, res): Promise<any> => {
       return oMsg;
     });
 
+    // --- ASYNCHRONOUSLY PRE-PARSE ALL ATTACHED FILES (PDF, WORD, EXCEL, TEXT) ---
+    for (const msg of optimizedMessages) {
+      if (msg.files && Array.isArray(msg.files)) {
+        for (const file of msg.files) {
+          if (file.base64 && typeof file.base64 === "string" && !file.parsedText && !file.base64.startsWith("[Данные")) {
+            const match = file.base64.match(/^data:([^;]+);base64,(.+)$/);
+            if (match) {
+              const mimeType = match[1];
+              const base64Data = match[2];
+              try {
+                file.parsedText = await parseFileToText(file.name, mimeType, base64Data);
+              } catch (parseError: any) {
+                console.warn(`[Pre-parse] Error parsing file '${file.name}':`, parseError);
+                file.parsedText = `[Ошибка парсинга файла "${file.name}"]: ${parseError.message || parseError}`;
+              }
+            }
+          }
+        }
+      }
+    }
+
     // --- SMART MEMORY LAYER / HISTORY OPTIMIZATION & COMPRESSION ---
     let totalChars = 0;
     for (const msg of optimizedMessages) {
@@ -1268,7 +1399,22 @@ app.post("/api/chat", async (req, res): Promise<any> => {
     let provider: "DeepSeek" | "Gemini" | "RouterAI" = "DeepSeek";
     let activeModel = "";
     const isReasoning = !!deepThink;
-    const modelSelection = requestedModel || "auto";
+    let modelSelection = requestedModel || "auto";
+
+    // Detect images and force vision-capable model if the selected model does not support images
+    const hasImages = activeMessages.some((m: any) => m.files && m.files.some((f: any) => f.type && f.type.startsWith("image/")));
+    
+    if (hasImages) {
+      const selectedLower = modelSelection.toLowerCase();
+      const isVisionCapable = selectedLower.includes("gemini") || 
+                              selectedLower.includes("gpt") || 
+                              selectedLower.includes("vision") || 
+                              selectedLower === "auto";
+      if (!isVisionCapable) {
+        console.log(`[Cognitive Routing] Image detected but selected model '${modelSelection}' is text-only. Forcing auto-routing to prevent crash.`);
+        modelSelection = "auto";
+      }
+    }
 
     // Extract last user message to assess model preferences
     const lastUserMessage = activeMessages.slice().reverse().find((m: any) => m.role === "user")?.content || "";
@@ -1321,7 +1467,10 @@ app.post("/api/chat", async (req, res): Promise<any> => {
       provider = "RouterAI";
       
       if (modelSelection === "auto") {
-        if (containsComplexTask) {
+        if (hasImages) {
+          activeModel = containsComplexTask ? "openai/gpt-4o" : "google/gemini-2.5-flash";
+          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: В вашем сообщении обнаружены изображения/файлы. Сервер автоматически перенаправил запрос на мультимодальную модель "${activeModel}" с поддержкой компьютерного зрения (Vision). Начни ответ с дружелюбного комментария: "Чувак, я вижу твою картинку! Под это дело я специально взял модель ${activeModel === "openai/gpt-4o" ? "GPT-4o (Vision)" : "Gemini 2.5 Flash (Vision)"}, чтобы всё отлично разглядеть."`;
+        } else if (containsComplexTask) {
           // High complexity -> route to flagships: DeepSeek R1 or GPT-4o
           activeModel = userRequestedModelPrefix === "openai" ? "openai/gpt-4o" : "deepseek/deepseek-r1";
           
@@ -1340,7 +1489,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
           if (userRequestedModelPrefix) {
             routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Подтверждена простая задача. Сервер послушно задействовал выбранный тобой "${activeModel}". Сделай забавное замечание в начале ответа, например: "Класс, задача простая, поэтому с удовольствием юзаю ${userRequestedModelLabel}!"`;
           } else {
-            routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Обычный легкий запрос. Сервер автоматически задействовал быструю модель "${activeModel}".`;
+            routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Обычный легкий запрос. Сервер автоматически задействовал быстрой модель "${activeModel}".`;
           }
         }
       } else if (modelSelection === "gemini-3.5-flash") {
@@ -1355,7 +1504,11 @@ app.post("/api/chat", async (req, res): Promise<any> => {
     } else {
       // Direct traditional provider configurations
       if (modelSelection === "auto") {
-        if (hasDeepSeek) {
+        if (hasImages && hasGemini) {
+          provider = "Gemini";
+          activeModel = "gemini-3.5-flash";
+          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: В вашем сообщении обнаружены изображения. Сервер автоматически перенаправил запрос на модель Gemini ("${activeModel}"), так как она полностью поддерживает Vision. Дружелюбно скажи пользователю об этом в начале.`;
+        } else if (hasDeepSeek) {
           provider = "DeepSeek";
           activeModel = isReasoning ? "deepseek-reasoning" : "deepseek-chat";
           
@@ -1715,9 +1868,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
           }
           
           const parts: any[] = [];
-          if (msg.content) {
-            parts.push({ text: msg.content });
-          }
+          let combinedText = msg.content || "";
           
           if (msg.files && Array.isArray(msg.files)) {
             for (const file of msg.files) {
@@ -1725,14 +1876,36 @@ app.post("/api/chat", async (req, res): Promise<any> => {
               if (match) {
                 const mimeType = match[1];
                 const base64Data = match[2];
-                parts.push({
-                  inlineData: {
-                    mimeType: mimeType,
-                    data: base64Data
+                
+                if (file.parsedText && !file.parsedText.includes("двоичный формат, прямое распознавание текста не поддерживается")) {
+                  combinedText = combinedText 
+                    ? `${combinedText}\n\n${file.parsedText}`
+                    : file.parsedText;
+                } else {
+                  // Direct inlineData support for images, pdfs, audios, video
+                  const isMultimodalEligible = mimeType.startsWith("image/") || 
+                                               mimeType === "application/pdf" || 
+                                               mimeType.startsWith("audio/") || 
+                                               mimeType.startsWith("video/");
+                  if (isMultimodalEligible) {
+                    parts.push({
+                      inlineData: {
+                        mimeType: mimeType,
+                        data: base64Data
+                      }
+                    });
+                  } else {
+                    combinedText = combinedText 
+                      ? `${combinedText}\n\n[Вложенный файл: ${file.name} (тип: ${mimeType}) - двоичный формат, содержимое скрыто]`
+                      : `[Вложенный файл: ${file.name} (тип: ${mimeType}) - двоичный формат, содержимое скрыто]`;
                   }
-                });
+                }
               }
             }
+          }
+          
+          if (combinedText) {
+            parts.push({ text: combinedText });
           }
           
           if (msg.tool_calls) {
